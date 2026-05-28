@@ -1,0 +1,10 @@
+[install]
+minimumReleaseAgeExcludes = [
+  "@tursodatabase/database",
+  "@tursodatabase/database-common",
+  "@tursodatabase/database-darwin-arm64",
+  "@tursodatabase/database-linux-arm64-gnu",
+  "@tursodatabase/database-linux-x64-gnu",
+  "@tursodatabase/database-win32-x64-msvc",
+]
+
