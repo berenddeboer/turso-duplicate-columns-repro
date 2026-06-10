@@ -6,6 +6,14 @@ import { join } from "node:path"
 
 type RowLike = Record<string, unknown> & {
   readonly [index: number]: unknown
+  readonly length?: number
+}
+
+// Mirrors how an array-like consumer (e.g. Drizzle's sqlite-proxy) reads a row
+// positionally. Returns [] when the row is not array-like (no `length`).
+function arrayFromRow(row: RowLike | undefined): unknown[] {
+  if (row === undefined) return []
+  return Array.from(row as ArrayLike<unknown>)
 }
 
 type ReproResult = {
@@ -27,20 +35,66 @@ async function main() {
     printResult(libsql)
     printResult(turso)
 
-    const libsqlPreservesPositions =
-      libsql.objectRow?.[0] === "/Employee" && libsql.objectRow?.[1] === "/"
-    const tursoLosesPositions =
-      turso.objectRow?.[0] === undefined && turso.objectRow?.[1] === undefined
+    // libsql returns array-like rows (they have `length` and numeric indices),
+    // so Array.from(row) recovers every selected column positionally even when
+    // the column names are duplicated.
+    const libsqlRow = libsql.objectRow
+    const libsqlArrayLikePreserved =
+      JSON.stringify(arrayFromRow(libsqlRow)) ===
+      JSON.stringify(["/Employee", "/"])
+
+    // After tursodatabase/turso#7285, Turso db.all() rows DO carry the
+    // positional values via numeric index access (row[0]/row[1]).
+    const tursoRow = turso.objectRow
+    const tursoIndexedPreserved =
+      tursoRow?.[0] === "/Employee" && tursoRow?.[1] === "/"
+
+    // ...but the row is still NOT array-like: it has no `length` property and
+    // is not iterable, and the duplicate column name collapses the enumerable
+    // string keys. So the standard ways to read a row positionally are all
+    // still broken:
+    //   Object.keys(row)   -> ["path"]   (1 key, not 2)
+    //   Object.values(row) -> ["/"]      (1 value, the last duplicate)
+    //   Array.from(row)    -> []         (no `length`, so not array-like)
+    //   [...row]           -> TypeError  (not iterable)
+    // sqlite-proxy consumers such as Drizzle read selected fields positionally
+    // (via Array.from(row) / Object.values(row)), so they still receive a
+    // short, misaligned array and silently corrupt results. @libsql/client
+    // works there precisely because its rows ARE array-like.
+    const tursoLength = (tursoRow as { length?: unknown } | undefined)?.length
+    const tursoNotArrayLike = tursoLength === undefined
+    const tursoArrayFromBroken =
+      JSON.stringify(arrayFromRow(tursoRow)) ===
+      JSON.stringify([])
+    const tursoNotIterable =
+      typeof (tursoRow as { [Symbol.iterator]?: unknown } | undefined)?.[
+        Symbol.iterator
+      ] !== "function"
+
     const tursoRawPreservesPositions =
       JSON.stringify(turso.rawRows) === JSON.stringify([["/Employee", "/"]])
 
-    if (!libsqlPreservesPositions) {
-      throw new Error("libsql did not expose the duplicate columns positionally")
+    if (!libsqlArrayLikePreserved) {
+      throw new Error(
+        "libsql rows are no longer array-like; this repro's baseline assumption changed",
+      )
     }
 
-    if (!tursoLosesPositions) {
+    if (!tursoIndexedPreserved) {
       throw new Error(
-        "Turso db.all() exposed positional values; this repro may no longer reproduce",
+        "Turso db.all() did not expose positional values via numeric index; #7285 may have regressed",
+      )
+    }
+
+    if (!tursoNotArrayLike || !tursoArrayFromBroken) {
+      throw new Error(
+        "Turso db.all() rows are now array-like (have `length`); this repro may no longer reproduce",
+      )
+    }
+
+    if (!tursoNotIterable) {
+      throw new Error(
+        "Turso db.all() row is now iterable; this repro may no longer reproduce",
       )
     }
 
@@ -48,7 +102,15 @@ async function main() {
       throw new Error("Turso raw(true) did not return both positional values")
     }
 
-    console.log("Observed difference: libsql keeps positional row values; Turso db.all() does not.")
+    console.log(
+      "\nStill reproduces on 0.7.0-pre.6 (with #7285 applied):\n" +
+        "  - Turso db.all() rows now carry numeric props (row[0], row[1]) ✔\n" +
+        "  - but the row is NOT array-like (no `length`) and NOT iterable ✘\n" +
+        "  - and Object.keys()/Object.values() still collapse duplicate column names ✘\n" +
+        "  - so Array.from(row) -> [], [...row] throws, Object.values(row) -> short array.\n" +
+        "  - @libsql/client rows ARE array-like, so sqlite-proxy/Drizzle work there but not on Turso.\n" +
+        "  - raw(true).all() is currently the only reliable positional accessor on Turso.",
+    )
   } finally {
     await rm(workDir, { recursive: true, force: true })
   }
@@ -134,6 +196,25 @@ function printResult(result: ReproResult) {
 
   console.log(`\n${result.label}`)
   console.log("  Object.keys(row):", JSON.stringify(Object.keys(row ?? {})))
+  console.log("  Object.values(row):", JSON.stringify(Object.values(row ?? {})))
+  console.log(
+    "  Object.getOwnPropertyNames(row):",
+    JSON.stringify(Object.getOwnPropertyNames(row ?? {})),
+  )
+  console.log(
+    "  row.length:",
+    JSON.stringify((row as { length?: unknown } | undefined)?.length),
+  )
+  console.log(
+    "  Array.from(row):",
+    JSON.stringify(arrayFromRow(row)),
+  )
+  console.log(
+    "  iterable:",
+    typeof (row as { [Symbol.iterator]?: unknown } | undefined)?.[
+      Symbol.iterator
+    ] === "function",
+  )
   console.log("  row.path:", JSON.stringify(row?.path))
   console.log("  row[0]:", JSON.stringify(row?.[0]))
   console.log("  row[1]:", JSON.stringify(row?.[1]))
